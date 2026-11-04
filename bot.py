@@ -4,6 +4,7 @@ import re
 import asyncio
 import sqlite3
 import urllib.request
+import urllib.parse
 from dotenv import load_dotenv
 from PIL import Image
 
@@ -13,7 +14,10 @@ from aiogram.types import (
     Message,
     CallbackQuery,
     InlineKeyboardMarkup,
-    InlineKeyboardButton
+    InlineKeyboardButton,
+    BotCommand,
+    BotCommandScopeDefault,
+    BufferedInputFile
 )
 from google import genai
 from google.genai import types
@@ -58,7 +62,6 @@ def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        # Таблица профиля питания
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS settings (
                 chat_id INTEGER PRIMARY KEY,
@@ -130,7 +133,6 @@ def get_favorite_by_id(fav_id: int, chat_id: int):
         )
         return cursor.fetchone()
 
-# Управление настройками питания
 def get_user_settings(chat_id: int) -> dict:
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
@@ -184,7 +186,21 @@ def extract_recipe_title(text: str) -> str:
     return "Фирменное блюдо KitChef"
 
 
-# --- ФОРМИРОВАНИЕ СИСТЕМНОГО ПРОМПТА ПОД ПРОФИЛЬ ---
+# --- ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЯ БЛЮДА ---
+
+def fetch_pollinations_image(prompt_str: str) -> bytes:
+    """Синхронный запрос к Pollinations AI для запуска в фоновом потоке."""
+    encoded_prompt = urllib.parse.quote(prompt_str)
+    image_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true"
+    req = urllib.request.Request(
+        image_url,
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    )
+    with urllib.request.urlopen(req, timeout=35) as response:
+        return response.read()
+
+
+# --- ФОРМИРОВАНИЕ СИСТЕМНОГО ПРОМПТА ---
 
 def build_system_prompt(chat_id: int) -> str:
     user_conf = get_user_settings(chat_id)
@@ -194,7 +210,7 @@ def build_system_prompt(chat_id: int) -> str:
     if user_conf["gluten_free"]:
         restrictions.append("Без глютена (исключи пшеницу, муку, обычные макароны)")
     if user_conf["lactose_free"]:
-        restrictions.append("Без лактозы (замени молоко, сливочное масло, обычные сливки на растительные)")
+        restrictions.append("Без лактозы (замени молоко, масло, обычные сливки на растительные)")
     if user_conf["sugar_free"]:
         restrictions.append("Без сахара")
 
@@ -229,6 +245,9 @@ def get_recipe_keyboard() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(text="⚡ Быстрее / Проще", callback_data="action_simpler_recipe"),
+            InlineKeyboardButton(text="📸 Фото блюда", callback_data="action_generate_photo")
+        ],
+        [
             InlineKeyboardButton(text="⭐ В избранное", callback_data="action_save_fav")
         ]
     ]
@@ -238,7 +257,7 @@ def get_fav_view_keyboard(fav_id: int) -> InlineKeyboardMarkup:
     buttons = [
         [
             InlineKeyboardButton(text="🛒 Список покупок", callback_data="action_shopping_list"),
-            InlineKeyboardButton(text="⚡ Быстрее / Проще", callback_data="action_simpler_recipe")
+            InlineKeyboardButton(text="📸 Фото блюда", callback_data="action_generate_photo")
         ],
         [
             InlineKeyboardButton(text="🗑️ Удалить из избранного", callback_data=f"delete_fav_{fav_id}"),
@@ -250,12 +269,10 @@ def get_fav_view_keyboard(fav_id: int) -> InlineKeyboardMarkup:
 def get_settings_keyboard(chat_id: int) -> tuple[str, InlineKeyboardMarkup]:
     conf = get_user_settings(chat_id)
 
-    # Иконки для выбранной диеты
     d_standard = "✅ Обычное" if conf["diet"] == "Обычное" else "⚪ Обычное"
     d_veg = "✅ Вегетарианское" if conf["diet"] == "Вегетарианское" else "⚪ Вегетарианское"
     d_fit = "✅ Фитнес / ПП" if conf["diet"] == "Фитнес / ПП" else "⚪ Фитнес / ПП"
 
-    # Иконки для исключений
     r_gluten = "✅ Без глютена" if conf["gluten_free"] else "⚪ Без глютена"
     r_lactose = "✅ Без лактозы" if conf["lactose_free"] else "⚪ Без лактозы"
     r_sugar = "✅ Без сахара" if conf["sugar_free"] else "⚪ Без сахара"
@@ -294,10 +311,10 @@ def get_settings_keyboard(chat_id: int) -> tuple[str, InlineKeyboardMarkup]:
 
 # --- ВЫЗОВ ИИ ---
 
-async def keep_typing(chat_id: int, stop_event: asyncio.Event):
+async def keep_typing(chat_id: int, stop_event: asyncio.Event, action: str = "typing"):
     while not stop_event.is_set():
         try:
-            await bot.send_chat_action(chat_id=chat_id, action="typing")
+            await bot.send_chat_action(chat_id=chat_id, action=action)
         except Exception:
             pass
         try:
@@ -399,7 +416,7 @@ async def show_favorites_menu(chat_id: int, target_message: Message = None):
 async def cmd_start(message: Message):
     await message.answer(
         f"Привет, {message.from_user.first_name}! 👨‍🍳\n\n"
-        "Я твой шеф-повар **KitChef** с персональным профилем питания.\n"
+        "Я твой шеф-повар **KitChef** с персональным профилем питания и генератором подачи блюд.\n"
         "• Отправь список продуктов текстом\n"
         "• Или пришли фото стола / холодильника — я составлю меню!\n\n"
         "⚙️ Настрой диету и исключения: /settings\n"
@@ -463,6 +480,52 @@ async def handle_delete_fav(callback: CallbackQuery):
     delete_favorite(fav_id, chat_id)
     await callback.answer("Рецепт удалён из избранного! 🗑️", show_alert=True)
     await show_favorites_menu(chat_id, callback.message)
+
+# Генерация фото ресторанной подачи блюда
+@dp.callback_query(F.data == "action_generate_photo")
+async def handle_generate_dish_photo(callback: CallbackQuery):
+    chat_id = callback.message.chat.id
+    recipe_text = callback.message.text or callback.message.caption or ""
+    await callback.answer("Шеф готовит подачу блюда... 📸")
+
+    title = extract_recipe_title(recipe_text)
+    print(f"\n-> Генерация фото для блюда: '{title}' от {chat_id}")
+
+    stop_typing = asyncio.Event()
+    typing_task = asyncio.create_task(keep_typing(chat_id, stop_typing, action="upload_photo"))
+
+    try:
+        # Переводим название на английский через Gemini для лучшего качества генерации
+        translation_prompt = (
+            f"Translate this dish name into a concise appetizing English food photo description "
+            f"(up to 8 words, focus only on the food name and garnish): '{title}'"
+        )
+        en_resp = await ai_client.aio.models.generate_content(
+            model="gemini-flash-lite-latest",
+            contents=translation_prompt
+        )
+        en_dish_title = en_resp.text.strip().replace('"', '').replace('.', '') if en_resp.text else title
+
+        full_prompt = (
+            f"Professional commercial food photography of {en_dish_title}, "
+            f"served on an elegant modern ceramic plate, appetizing culinary restaurant plating, "
+            f"warm lighting, macro lens detail, photorealistic, 8k"
+        )
+
+        # Скачиваем изображение из Pollinations AI в фоновом потоке
+        image_bytes = await asyncio.to_thread(fetch_pollinations_image, full_prompt)
+        photo_file = BufferedInputFile(image_bytes, filename="dish.jpg")
+
+        caption = f"📸 **{title}** в авторской подаче от KitChef!\nПриятного аппетита! 👨‍🍳✨"
+        await callback.message.reply_photo(photo=photo_file, caption=caption, reply_markup=get_recipe_keyboard())
+        print("-> Фото блюда успешно отправлено!")
+
+    except Exception as e:
+        print(f"[!] Ошибка генерации фото: {type(e).__name__} -> {e}")
+        await callback.message.answer("Не удалось сгенерировать фото блюда. Попробуй ещё раз.")
+    finally:
+        stop_typing.set()
+        await typing_task
 
 @dp.callback_query(F.data.startswith("action_"))
 async def handle_recipe_button(callback: CallbackQuery):
@@ -589,9 +652,22 @@ async def handle_chef_text(message: Message):
         stop_typing.set()
         await typing_task
 
+
+# --- РЕГИСТРАЦИЯ КОМАНД МЕНЮ В TELEGRAM ---
+
+async def set_main_menu(bot_instance: Bot):
+    commands = [
+        BotCommand(command="start", description="👨‍🍳 Перезапуск и шеф-меню"),
+        BotCommand(command="settings", description="⚙️ Диета и профиль питания"),
+        BotCommand(command="favorites", description="📖 Моя книга рецептов")
+    ]
+    await bot_instance.set_my_commands(commands, scope=BotCommandScopeDefault())
+    print("-> Команды меню успешно зарегистрированы в Telegram!")
+
 async def main():
     init_db()
-    print("База данных SQLite подключена. KitChef AI слушает Telegram...")
+    await set_main_menu(bot)
+    print("База данных подключена. KitChef AI слушает Telegram...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
